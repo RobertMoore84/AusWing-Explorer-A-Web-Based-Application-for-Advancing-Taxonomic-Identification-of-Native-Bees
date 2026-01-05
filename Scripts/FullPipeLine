@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+
+# ============================================================
+# AusWing Explorer – FULL 2D Diagnostic Identification Script
+# (Website-equivalent logic, local standalone)
+# ============================================================
+
+# ------------------------------------------------------------
+# FORCE INTERACTIVE BACKEND (Windows-safe)
+# ------------------------------------------------------------
+
+import matplotlib
+matplotlib.use("TkAgg")
+
+# ------------------------------------------------------------
+# IMPORTS
+# ------------------------------------------------------------
+
+import os
+import yaml
+import json
+import numpy as np
+import pandas as pd
+import subprocess
+from math import pi
+
+import tkinter as tk
+from tkinter import filedialog
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
+from matplotlib.backend_bases import MouseButton
+
+from sklearn.manifold import TSNE
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from scipy.stats import chi2, entropy
+
+# ------------------------------------------------------------
+# PATHS
+# ------------------------------------------------------------
+
+BASE_DIR = os.path.abspath(".")
+
+TRAINING_COORDS = os.path.join(BASE_DIR, "training_coords.csv")
+TRAINING_LABELS = os.path.join(BASE_DIR, "training_labels.csv")
+CONFIG_PATH = os.path.join(BASE_DIR, "config.yaml")
+R_SCRIPT = os.path.join(BASE_DIR, "project_unknown.R")
+
+RSCRIPT_EXE = r"C:\Program Files\R\R-4.4.3\bin\Rscript.exe"
+
+RUNTIME_DIR = os.path.join(BASE_DIR, "runtime_local")
+UNKNOWN_LM_PATH = os.path.join(RUNTIME_DIR, "unknown_landmarks.csv")
+UNKNOWN_COORDS_PATH = os.path.join(RUNTIME_DIR, "unknown_coords.csv")
+DEBUG_JSON_PATH = os.path.join(RUNTIME_DIR, "diagnostics_full.json")
+TRACE_TXT_PATH = os.path.join(RUNTIME_DIR, "decision_trace.txt")
+
+os.makedirs(RUNTIME_DIR, exist_ok=True)
+
+# ------------------------------------------------------------
+# CONSTANTS
+# ------------------------------------------------------------
+
+CHI2_2D = chi2.ppf(0.95, df=2)
+MIN_SAMPLES = 4
+
+# ------------------------------------------------------------
+# LOAD CONFIG
+# ------------------------------------------------------------
+
+with open(CONFIG_PATH, "r") as f:
+    cfg = yaml.safe_load(f)
+
+TSNE_PARAMS = cfg["tsne_params"]
+
+# ------------------------------------------------------------
+# IMAGE PICKER (SAFE)
+# ------------------------------------------------------------
+
+def choose_image():
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+
+    path = filedialog.askopenfilename(
+        initialdir=BASE_DIR,
+        title="Select wing image",
+        filetypes=[
+            ("Image files", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp"),
+            ("All files", "*.*")
+        ]
+    )
+
+    root.destroy()
+    del root
+
+    if not path:
+        raise RuntimeError("No image selected")
+
+    return path
+
+# ------------------------------------------------------------
+# LANDMARK COLLECTION
+# ------------------------------------------------------------
+
+def collect_landmarks(image_path, n_landmarks=14):
+    plt.close("all")
+
+    img = plt.imread(image_path)
+    points = []
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.imshow(img)
+    ax.set_title(f"Click {n_landmarks} landmarks in order")
+    ax.axis("off")
+
+    def onclick(event):
+        if event.inaxes != ax:
+            return
+        if event.button is MouseButton.LEFT:
+            points.append((event.xdata, event.ydata))
+            ax.plot(event.xdata, event.ydata, "ro")
+            ax.text(event.xdata, event.ydata, str(len(points)), color="red")
+            fig.canvas.draw_idle()
+
+            if len(points) == n_landmarks:
+                fig.canvas.mpl_disconnect(cid)
+                plt.close(fig)
+
+    cid = fig.canvas.mpl_connect("button_press_event", onclick)
+    plt.show(block=True)
+
+    if len(points) != n_landmarks:
+        raise RuntimeError(
+            f"Incorrect number of landmarks collected ({len(points)} / {n_landmarks})"
+        )
+
+    pts = np.array(points, dtype=float)
+    pts[:, 1] = img.shape[0] - pts[:, 1]
+
+    pd.DataFrame(pts).to_csv(UNKNOWN_LM_PATH, index=False, header=False)
+    return pts
+
+# ------------------------------------------------------------
+# LANDMARK SELECTION
+# ------------------------------------------------------------
+
+def obtain_landmarks():
+    if os.path.exists(UNKNOWN_LM_PATH):
+        print("\nExisting landmark file detected.")
+        print("[1] Use existing landmarks")
+        print("[2] Collect new sample")
+
+        while True:
+            choice = input("Enter choice (1/2): ").strip()
+
+            if choice == "1":
+                lm = pd.read_csv(UNKNOWN_LM_PATH, header=None).values
+                if lm.shape != (14, 2):
+                    raise RuntimeError("Existing landmark file invalid")
+                print("Using existing landmarks.")
+                return lm.astype(float)
+
+            elif choice == "2":
+                image_path = choose_image()
+                print("Collecting new landmarks...")
+                return collect_landmarks(image_path)
+
+            else:
+                print("Invalid choice.")
+    else:
+        print("No landmark file found.")
+        image_path = choose_image()
+        return collect_landmarks(image_path)
+
+# ------------------------------------------------------------
+# PROCRUSTES PROJECTION
+# ------------------------------------------------------------
+
+def project_unknown():
+    subprocess.run(
+        [RSCRIPT_EXE, R_SCRIPT, RUNTIME_DIR, BASE_DIR],
+        check=True
+    )
+
+    vec = pd.read_csv(UNKNOWN_COORDS_PATH).iloc[0].values.astype(float)
+    if vec.shape[0] != 28:
+        raise ValueError("Projected unknown must have 28 values")
+    return vec
+
+# ------------------------------------------------------------
+# ELLIPSE GEOMETRY
+# ------------------------------------------------------------
+
+def draw_ellipse(ax, mean, cov, label):
+    vals, vecs = np.linalg.eigh(cov)
+    order = vals.argsort()[::-1]
+    vals, vecs = vals[order], vecs[:, order]
+
+    angle = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0]))
+    width, height = 2 * np.sqrt(CHI2_2D * vals)
+
+    ell = Ellipse(
+        xy=mean,
+        width=width,
+        height=height,
+        angle=angle,
+        alpha=0.25
+    )
+
+    ax.add_patch(ell)
+    ax.text(mean[0], mean[1], label, ha="center", fontsize=8)
+
+def ellipses_intersect(mean1, cov1, mean2, cov2):
+    try:
+        diff = mean1 - mean2
+        cov_sum = cov1 + cov2
+        d = diff.T @ np.linalg.inv(cov_sum) @ diff
+        return d <= CHI2_2D
+    except np.linalg.LinAlgError:
+        return False
+
+# ------------------------------------------------------------
+# MAIN PIPELINE
+# ------------------------------------------------------------
+
+def run_pipeline():
+
+    diagnostics = {}
+    trace = []
+
+    X_train = pd.read_csv(TRAINING_COORDS)
+    y_train = pd.read_csv(TRAINING_LABELS)
+    coord_cols = list(X_train.columns)
+
+    obtain_landmarks()
+
+    print("Projecting unknown...")
+    unknown_vec = project_unknown()
+
+    unknown_row = pd.DataFrame([unknown_vec], columns=coord_cols)
+    unknown_meta = pd.DataFrame([{
+        "Id": -1,
+        "Family": "UNKNOWN",
+        "Genus": "UNKNOWN",
+        "Subgenus": "UNKNOWN",
+        "Species": "UNKNOWN"
+    }])
+
+    df = pd.concat(
+        [
+            pd.concat([y_train, X_train], axis=1),
+            pd.concat([unknown_meta, unknown_row], axis=1)
+        ],
+        ignore_index=True
+    )
+
+    predictions = {}
+
+    for level in ["Family", "Genus", "Subgenus", "Species"]:
+
+        print(f"\n--- {level} ---")
+        diagnostics[level] = {}
+
+        params = TSNE_PARAMS[level].copy()
+        params["n_components"] = 2
+
+        emb = TSNE(**params).fit_transform(df[coord_cols].values)
+        df["tsne1"], df["tsne2"] = emb[:, 0], emb[:, 1]
+
+        unknown = df[df[level] == "UNKNOWN"].iloc[0]
+        u = unknown[["tsne1", "tsne2"]].values
+
+        stats = {}
+        inside = {}
+
+        for label in df[level].unique():
+            if label == "UNKNOWN":
+                continue
+
+            sub = df[df[level] == label]
+            if len(sub) < MIN_SAMPLES:
+                continue
+
+            mean = sub[["tsne1", "tsne2"]].mean().values
+            cov = np.cov(sub[["tsne1", "tsne2"]].values.T)
+
+            dist = float((u - mean).T @ np.linalg.inv(cov) @ (u - mean))
+            stats[label] = (mean, cov)
+
+            print(f"{label}: dist={dist:.2f}")
+
+            if dist <= CHI2_2D:
+                inside[label] = dist
+
+        # ---- EXPAND VIA ELLIPSE INTERSECTION ----
+        expanded = set(inside.keys())
+
+        for a in list(expanded):
+            m1, c1 = stats[a]
+            for b, (m2, c2) in stats.items():
+                if b in expanded:
+                    continue
+                if ellipses_intersect(m1, c1, m2, c2):
+                    expanded.add(b)
+
+        # ---- DECISION ----
+        if not expanded:
+            predictions[level] = "Below acceptable threshold"
+
+        elif len(expanded) == 1:
+            predictions[level] = next(iter(expanded))
+
+        else:
+            print("LDA triggered on:", sorted(expanded))
+
+            sub = df[df[level].isin(expanded)]
+            X = sub[coord_cols].values
+            y = sub[level].values
+            mask = y != "UNKNOWN"
+
+            lda = LinearDiscriminantAnalysis()
+            lda.fit(X[mask], y[mask])
+
+            probs = lda.predict_proba([unknown_vec])[0]
+            for cls, p in zip(lda.classes_, probs):
+                print(f"  {cls}: {p:.3f}")
+
+            predictions[level] = lda.classes_[np.argmax(probs)]
+
+        print("Prediction:", predictions[level])
+
+        # ---- PLOT ----
+        fig, ax = plt.subplots(figsize=(10, 8))
+        for label, (mean, cov) in stats.items():
+            draw_ellipse(ax, mean, cov, label)
+
+        ax.scatter(df["tsne1"], df["tsne2"], s=8, alpha=0.6)
+        ax.scatter(u[0], u[1], c="red", marker="x", s=120)
+        ax.set_title(level)
+        plt.show()
+
+        if level == "Family" and predictions[level] != "Below acceptable threshold":
+            df = df[df["Family"].isin([predictions[level], "UNKNOWN"])]
+
+    return predictions
+
+# ------------------------------------------------------------
+# ENTRY POINT
+# ------------------------------------------------------------
+
+if __name__ == "__main__":
+
+    results = run_pipeline()
+
+    print("\nFINAL RESULTS")
+    for k, v in results.items():
+        print(f"{k}: {v}")
