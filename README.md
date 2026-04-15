@@ -99,4 +99,4 @@ The results demonstrate the effectiveness of AusWing Explorer in classifying Aus
 ## Citation
 If you use this code or data for your own work, please cite the manuscript associated with this project:
 
-**AusWing Explorer: A Web-Based Application for Advancing Taxonomic Identification of Native Bees Through Integrated Morphometric Analysis, [Your Name] (2024).**
+**Moore, R.A., Symonds, M.R., Kellermann, V., Walker, K., Berry, S., da Silva, C.R. and Howard, S.R. (2026). Advancing taxonomic identification of native bees through integrated morphometric analysis. *Ecological Informatics*, 103616.**
